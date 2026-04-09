@@ -338,6 +338,7 @@ static DWORD WINAPI InitializeProxy(LPVOID)
     StartMemoryScanner();
     StartHeartbeat();
     HookCreateThread();
+    StartThreadGuard();
 
     LOG_OK("INIT", "╔══════════════════════════════════════════╗");
     LOG_OK("INIT", "║         PROXY INIT COMPLETADO             ║");
@@ -493,6 +494,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved)
     }
     else if (reason == DLL_PROCESS_DETACH)
     {
+        StopThreadGuard();
         StopHeartbeat();
         StopMemoryScanner();
         StopModuleWatcher();

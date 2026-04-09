@@ -7,6 +7,7 @@
 #include <psapi.h>
 #include <unordered_map>
 #include <string>
+#include <vector>
 #include <atomic>
 #include <mutex>
 #include <cinttypes>
@@ -569,4 +570,248 @@ void DumpHandleSnapshot()
     DWORD handleCount = 0;
     if (GetProcessHandleCount(GetCurrentProcess(), &handleCount))
         LOG_INFO("HANDLES", "Handles abiertos en el proceso: %lu", handleCount);
+}
+
+// ============================================================================
+//  THREAD GUARD — detección y suspensión agresiva de hilos sospechosos
+// ============================================================================
+
+// NtQueryInformationThread cargada dinámicamente desde ntdll.dll
+typedef LONG (NTAPI* PFN_NtQueryInformationThread)(
+    HANDLE  ThreadHandle,
+    ULONG   ThreadInformationClass,
+    PVOID   ThreadInformation,
+    ULONG   ThreadInformationLength,
+    PULONG  ReturnLength);
+
+// ThreadQuerySetWin32StartAddress — clase de información para obtener
+// la dirección de inicio original (Win32 entry point) de un hilo
+static const ULONG TH_WIN32_START_ADDR = 9;
+
+// Dirección base del módulo MZ fantasma detectado en logs
+static const DWORD_PTR GHOST_BASE  = 0x63480000ULL;
+static const SIZE_T    GHOST_RANGE = 0x10000ULL; // 64 KB de margen
+
+static std::atomic<bool> g_threadGuardRunning{ false };
+static HANDLE            g_threadGuardThread  = nullptr;
+static DWORD             g_threadGuardTid     = 0;
+
+static constexpr DWORD THREAD_GUARD_INTERVAL_MS        = 1000;
+static constexpr DWORD THREAD_GUARD_SHUTDOWN_TIMEOUT_MS = 3000;
+
+// Rango de un módulo cargado legalmente en el proceso
+struct ModuleRange
+{
+    DWORD_PTR base;
+    DWORD_PTR end;
+};
+
+// Construye la lista de rangos de todos los módulos cargados en este ciclo
+static std::vector<ModuleRange> BuildModuleRanges()
+{
+    std::vector<ModuleRange> ranges;
+
+    HANDLE hSnap = CreateToolhelp32Snapshot(
+        TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32,
+        GetCurrentProcessId());
+
+    if (hSnap == INVALID_HANDLE_VALUE)
+        return ranges;
+
+    MODULEENTRY32 me;
+    me.dwSize = sizeof(me);
+
+    if (Module32First(hSnap, &me))
+    {
+        do {
+            DWORD_PTR base = (DWORD_PTR)me.modBaseAddr;
+            ranges.push_back({ base, base + me.modBaseSize });
+        } while (Module32Next(hSnap, &me));
+    }
+
+    CloseHandle(hSnap);
+    return ranges;
+}
+
+// Devuelve true si addr cae dentro del rango de algún módulo cargado
+static bool IsAddressInKnownModule(DWORD_PTR addr,
+                                    const std::vector<ModuleRange>& ranges)
+{
+    for (const auto& r : ranges)
+    {
+        if (addr >= r.base && addr < r.end)
+            return true;
+    }
+    return false;
+}
+
+// Escanea todos los hilos del proceso y suspende los sospechosos
+static void MonitorAndFreezeThreads()
+{
+    // Resolución única de NtQueryInformationThread
+    static PFN_NtQueryInformationThread pfnNtQIT   = nullptr;
+    static bool                         s_resolved = false;
+
+    if (!s_resolved)
+    {
+        s_resolved = true;
+        HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
+        if (hNtdll)
+            pfnNtQIT = (PFN_NtQueryInformationThread)
+                GetProcAddress(hNtdll, "NtQueryInformationThread");
+
+        if (pfnNtQIT)
+            LOG_OK("THREADGUARD",
+                   "NtQueryInformationThread resuelta @ 0x%016" PRIXPTR,
+                   (DWORD_PTR)pfnNtQIT);
+        else
+            LOG_WARN("THREADGUARD",
+                     "NtQueryInformationThread no encontrada — ThreadGuard inactivo");
+    }
+
+    if (!pfnNtQIT) return;
+
+    DWORD currentPid = GetCurrentProcessId();
+    DWORD currentTid = GetCurrentThreadId(); // TID del propio hilo guard
+
+    // Construir rangos de módulos legítimos para este ciclo
+    std::vector<ModuleRange> modRanges = BuildModuleRanges();
+
+    // Snapshot de todos los hilos del sistema
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (hSnap == INVALID_HANDLE_VALUE)
+    {
+        LOG_WARN("THREADGUARD",
+                 "CreateToolhelp32Snapshot (hilos) fallo (GLE: %lu)", GetLastError());
+        return;
+    }
+
+    THREADENTRY32 te;
+    te.dwSize = sizeof(te);
+
+    if (!Thread32First(hSnap, &te))
+    {
+        CloseHandle(hSnap);
+        return;
+    }
+
+    do
+    {
+        // Filtrar: solo hilos de nuestro proceso y no los propios del guard
+        if (te.th32OwnerProcessID != currentPid) continue;
+        if (te.th32ThreadID == currentTid)        continue;
+        if (te.th32ThreadID == g_threadGuardTid)  continue;
+
+        HANDLE hThread = OpenThread(
+            THREAD_QUERY_INFORMATION | THREAD_SUSPEND_RESUME,
+            FALSE,
+            te.th32ThreadID);
+
+        if (!hThread) continue;
+
+        // Obtener dirección de inicio Win32 del hilo
+        DWORD_PTR startAddr = 0;
+        LONG status = pfnNtQIT(
+            hThread,
+            TH_WIN32_START_ADDR,
+            &startAddr,
+            sizeof(startAddr),
+            nullptr);
+
+        if (status != 0L) // STATUS_SUCCESS == 0
+        {
+            CloseHandle(hThread);
+            continue;
+        }
+
+        // Verificar también con VirtualQuery que el tipo de memoria sea privado
+        MEMORY_BASIC_INFORMATION mbi = {};
+        bool memPrivate = false;
+        if (VirtualQuery((LPCVOID)startAddr, &mbi, sizeof(mbi)))
+            memPrivate = (mbi.Type == MEM_PRIVATE);
+
+        bool inGhostRange   = (startAddr >= GHOST_BASE &&
+                               startAddr <  GHOST_BASE + GHOST_RANGE);
+        bool inPrivateMem   = !IsAddressInKnownModule(startAddr, modRanges) && memPrivate;
+
+        if (inGhostRange || inPrivateMem)
+        {
+            const char* reason = inGhostRange
+                ? "MODULO_FANTASMA_0x63480000"
+                : "MEMORIA_PRIVADA_NO_MAPEADA";
+
+            LOG_ALERT("THREADGUARD",
+                      "!!! HILO SOSPECHOSO DETECTADO | TID=%lu"
+                      " | StartAddr=0x%016" PRIXPTR
+                      " | Motivo=%s | MemType=0x%X",
+                      te.th32ThreadID,
+                      startAddr,
+                      reason,
+                      mbi.Type);
+
+            DWORD suspendCount = SuspendThread(hThread);
+            if (suspendCount != (DWORD)-1)
+            {
+                LOG_ALERT("THREADGUARD",
+                          "    TID=%lu SUSPENDIDO exitosamente"
+                          " (SuspendCount previo: %lu)",
+                          te.th32ThreadID, suspendCount);
+                g_stats.threadsDetected++;
+            }
+            else
+            {
+                LOG_WARN("THREADGUARD",
+                         "    SuspendThread(TID=%lu) FALLO (GLE: %lu)",
+                         te.th32ThreadID, GetLastError());
+            }
+        }
+
+        CloseHandle(hThread);
+
+    } while (Thread32Next(hSnap, &te));
+
+    CloseHandle(hSnap);
+}
+
+static DWORD WINAPI ThreadGuardThread(LPVOID)
+{
+    g_threadGuardTid = GetCurrentThreadId();
+    LOG_INFO("THREADGUARD",
+             "Hilo ThreadGuard iniciado (TID: %lu | intervalo: %lums)",
+             g_threadGuardTid, THREAD_GUARD_INTERVAL_MS);
+
+    // Espera inicial para que el sistema se estabilice tras la carga del DLL
+    Sleep(2000);
+
+    while (g_threadGuardRunning.load())
+    {
+        MonitorAndFreezeThreads();
+        Sleep(THREAD_GUARD_INTERVAL_MS);
+    }
+
+    LOG_INFO("THREADGUARD", "Hilo ThreadGuard terminado.");
+    return 0;
+}
+
+void StartThreadGuard()
+{
+    g_threadGuardRunning = true;
+    g_threadGuardThread  = CreateThread(nullptr, 0, ThreadGuardThread, nullptr, 0, nullptr);
+    if (g_threadGuardThread)
+        LOG_OK("THREADGUARD", "ThreadGuard iniciado (TID: %lu)",
+               GetThreadId(g_threadGuardThread));
+    else
+        LOG_ALERT("THREADGUARD",
+                  "CreateThread ThreadGuard FALLO (GLE: %lu)", GetLastError());
+}
+
+void StopThreadGuard()
+{
+    g_threadGuardRunning = false;
+    if (g_threadGuardThread)
+    {
+        WaitForSingleObject(g_threadGuardThread, THREAD_GUARD_SHUTDOWN_TIMEOUT_MS);
+        CloseHandle(g_threadGuardThread);
+        g_threadGuardThread = nullptr;
+    }
 }
