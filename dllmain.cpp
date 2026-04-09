@@ -322,6 +322,9 @@ static DWORD WINAPI InitializeProxy(LPVOID)
     LOG_INFO("INIT", "║         PROXY INIT THREAD STARTED         ║");
     LOG_INFO("INIT", "╚══════════════════════════════════════════╝");
 
+    // Bloquear la región de inyección del anticheat lo antes posible
+    BlockAnticheatRegion();
+
     UltraLogger::LogProcessInfo();
     UltraLogger::LogSystemInfo();
 

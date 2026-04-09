@@ -31,3 +31,6 @@ void DumpHandleSnapshot();
 // ---- Thread Guard — suspende hilos que arrancan en memoria sospechosa --
 void StartThreadGuard();
 void StopThreadGuard();
+
+// ---- Page Blocker — reserva/protege la región de inyección del anticheat --
+void BlockAnticheatRegion();

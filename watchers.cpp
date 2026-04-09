@@ -6,11 +6,19 @@
 #include <tlhelp32.h>
 #include <psapi.h>
 #include <unordered_map>
+#include <unordered_set>
 #include <string>
 #include <vector>
 #include <atomic>
 #include <mutex>
 #include <cinttypes>
+
+// ============================================================================
+//  CONSTANTES GLOBALES — región fantasma del anticheat
+// ============================================================================
+// Dirección base del módulo MZ fantasma detectado en logs (inyectado por el AC)
+static const DWORD_PTR GHOST_BASE  = 0x63480000ULL;
+static const SIZE_T    GHOST_RANGE = 0x10000ULL; // 64 KB de margen
 
 // ============================================================================
 //  VECTORED EXCEPTION HANDLER
@@ -33,6 +41,19 @@ static LONG WINAPI VEH_Handler(EXCEPTION_POINTERS* ep)
     DWORD_PTR faultAddr = ep->ExceptionRecord->NumberParameters > 1
         ? (DWORD_PTR)ep->ExceptionRecord->ExceptionInformation[1]
         : (DWORD_PTR)ep->ExceptionRecord->ExceptionAddress;
+
+    // Si el anticheat intenta escribir en la región bloqueada, ignorar la
+    // excepción silenciosamente para evitar que crashee el proceso.
+    if (code == EXCEPTION_ACCESS_VIOLATION &&
+        faultAddr >= GHOST_BASE &&
+        faultAddr <  GHOST_BASE + GHOST_RANGE)
+    {
+        LOG_WARN("VEH",
+                 "AV interceptado en región AC bloqueada @ 0x%016" PRIXPTR
+                 " — ignorado (CONTINUE_EXECUTION)",
+                 faultAddr);
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
 
     UltraLogger::LogExceptionContext(code, faultAddr, ep->ContextRecord);
 
@@ -588,15 +609,11 @@ typedef LONG (NTAPI* PFN_NtQueryInformationThread)(
 // la dirección de inicio original (Win32 entry point) de un hilo
 static const ULONG TH_WIN32_START_ADDR = 9;
 
-// Dirección base del módulo MZ fantasma detectado en logs
-static const DWORD_PTR GHOST_BASE  = 0x63480000ULL;
-static const SIZE_T    GHOST_RANGE = 0x10000ULL; // 64 KB de margen
-
 static std::atomic<bool> g_threadGuardRunning{ false };
 static HANDLE            g_threadGuardThread  = nullptr;
 static DWORD             g_threadGuardTid     = 0;
 
-static constexpr DWORD THREAD_GUARD_INTERVAL_MS        = 1000;
+static constexpr DWORD THREAD_GUARD_INTERVAL_MS        = 10;   // 10ms — escaneo agresivo
 static constexpr DWORD THREAD_GUARD_STARTUP_DELAY_MS   = 2000; // deja estabilizar el loader
 static constexpr DWORD THREAD_GUARD_SHUTDOWN_TIMEOUT_MS = 3000;
 
@@ -636,10 +653,10 @@ static std::vector<ModuleRange> BuildModuleRanges()
 
     // Helper: añade el rango de un módulo si su base no está ya en la lista.
     // Usa un set temporal de bases construido una sola vez para evitar O(n²).
-    std::unordered_map<DWORD_PTR, bool> knownBases;
+    std::unordered_set<DWORD_PTR> knownBases;
     knownBases.reserve(ranges.size());
     for (const auto& r : ranges)
-        knownBases[r.base] = true;
+        knownBases.insert(r.base);
 
     auto AddModuleRange = [&](HMODULE hMod)
     {
@@ -649,7 +666,7 @@ static std::vector<ModuleRange> BuildModuleRanges()
         DWORD_PTR base = (DWORD_PTR)mi.lpBaseOfDll;
         if (knownBases.count(base)) return; // ya presente
         ranges.push_back({ base, base + mi.SizeOfImage });
-        knownBases[base] = true;
+        knownBases.insert(base);
     };
 
     // Siempre añadir nuestro propio proxy DLL (obtenido desde una dirección
@@ -680,6 +697,44 @@ static bool IsAddressInKnownModule(DWORD_PTR addr,
             return true;
     }
     return false;
+}
+
+// Intenta bloquear la región de memoria donde el anticheat inyecta su módulo PE.
+// Primero intenta reservar la región con MEM_RESERVE | PAGE_NOACCESS para que
+// cualquier escritura del AC levante una excepción de acceso (capturada por el VEH).
+// Si la región ya está comprometida, aplica VirtualProtect PAGE_NOACCESS.
+void BlockAnticheatRegion()
+{
+    LPVOID reserved = VirtualAlloc(
+        (LPVOID)GHOST_BASE,
+        GHOST_RANGE,
+        MEM_RESERVE | MEM_COMMIT,
+        PAGE_NOACCESS);
+
+    if (reserved)
+    {
+        LOG_OK("PAGEBLOCK",
+               "Región AC comprometida PAGE_NOACCESS @ 0x%016" PRIXPTR
+               " (size: 0x%zX)",
+               GHOST_BASE, GHOST_RANGE);
+        return;
+    }
+
+    // La región ya está en uso — intentar re-proteger con PAGE_NOACCESS
+    DWORD oldProt = 0;
+    if (VirtualProtect((LPVOID)GHOST_BASE, GHOST_RANGE, PAGE_NOACCESS, &oldProt))
+    {
+        LOG_OK("PAGEBLOCK",
+               "Región AC protegida PAGE_NOACCESS (era 0x%04X) @ 0x%016" PRIXPTR,
+               oldProt, GHOST_BASE);
+    }
+    else
+    {
+        LOG_WARN("PAGEBLOCK",
+                 "No se pudo bloquear la región AC @ 0x%016" PRIXPTR
+                 " (VirtualProtect GLE: %lu)",
+                 GHOST_BASE, GetLastError());
+    }
 }
 
 // Escanea todos los hilos del proceso y suspende los sospechosos
@@ -767,6 +822,15 @@ static void MonitorAndFreezeThreads()
             te.th32ThreadID);
 
         if (!hThread) continue;
+
+        // Stealth mode: descartar hilos que ya terminaron para no generar
+        // errores innecesarios en el log al intentar suspenderlos.
+        DWORD exitCode = 0;
+        if (GetExitCodeThread(hThread, &exitCode) && exitCode != STILL_ACTIVE)
+        {
+            CloseHandle(hThread);
+            continue;
+        }
 
         // Obtener dirección de inicio Win32 del hilo
         DWORD_PTR startAddr = 0;
