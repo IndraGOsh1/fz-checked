@@ -597,6 +597,7 @@ static HANDLE            g_threadGuardThread  = nullptr;
 static DWORD             g_threadGuardTid     = 0;
 
 static constexpr DWORD THREAD_GUARD_INTERVAL_MS        = 1000;
+static constexpr DWORD THREAD_GUARD_STARTUP_DELAY_MS   = 2000; // deja estabilizar el loader
 static constexpr DWORD THREAD_GUARD_SHUTDOWN_TIMEOUT_MS = 3000;
 
 // Rango de un módulo cargado legalmente en el proceso
@@ -606,7 +607,9 @@ struct ModuleRange
     DWORD_PTR end;
 };
 
-// Construye la lista de rangos de todos los módulos cargados en este ciclo
+// Construye la lista de rangos de todos los módulos cargados en este ciclo.
+// Siempre incluye explícitamente nuestro proxy DLL y vorbisFile_orig.dll para
+// evitar auto-suspensión incluso si el snapshot tiene una condición de carrera.
 static std::vector<ModuleRange> BuildModuleRanges()
 {
     std::vector<ModuleRange> ranges;
@@ -615,21 +618,55 @@ static std::vector<ModuleRange> BuildModuleRanges()
         TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32,
         GetCurrentProcessId());
 
-    if (hSnap == INVALID_HANDLE_VALUE)
-        return ranges;
-
-    MODULEENTRY32 me;
-    me.dwSize = sizeof(me);
-
-    if (Module32First(hSnap, &me))
+    if (hSnap != INVALID_HANDLE_VALUE)
     {
-        do {
-            DWORD_PTR base = (DWORD_PTR)me.modBaseAddr;
-            ranges.push_back({ base, base + me.modBaseSize });
-        } while (Module32Next(hSnap, &me));
+        MODULEENTRY32 me;
+        me.dwSize = sizeof(me);
+
+        if (Module32First(hSnap, &me))
+        {
+            do {
+                DWORD_PTR base = (DWORD_PTR)me.modBaseAddr;
+                ranges.push_back({ base, base + me.modBaseSize });
+            } while (Module32Next(hSnap, &me));
+        }
+
+        CloseHandle(hSnap);
     }
 
-    CloseHandle(hSnap);
+    // Helper: añade el rango de un módulo si su base no está ya en la lista.
+    // Usa un set temporal de bases construido una sola vez para evitar O(n²).
+    std::unordered_map<DWORD_PTR, bool> knownBases;
+    knownBases.reserve(ranges.size());
+    for (const auto& r : ranges)
+        knownBases[r.base] = true;
+
+    auto AddModuleRange = [&](HMODULE hMod)
+    {
+        if (!hMod) return;
+        MODULEINFO mi = {};
+        if (!GetModuleInformation(GetCurrentProcess(), hMod, &mi, sizeof(mi))) return;
+        DWORD_PTR base = (DWORD_PTR)mi.lpBaseOfDll;
+        if (knownBases.count(base)) return; // ya presente
+        ranges.push_back({ base, base + mi.SizeOfImage });
+        knownBases[base] = true;
+    };
+
+    // Siempre añadir nuestro propio proxy DLL (obtenido desde una dirección
+    // de función interna para no depender del nombre en disco)
+    {
+        HMODULE hSelf = nullptr;
+        GetModuleHandleExA(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            (LPCSTR)&BuildModuleRanges,
+            &hSelf);
+        AddModuleRange(hSelf);
+    }
+
+    // Siempre añadir la DLL original a la que reenviamos las llamadas
+    AddModuleRange(GetModuleHandleA("vorbisFile_orig.dll"));
+
     return ranges;
 }
 
@@ -673,6 +710,28 @@ static void MonitorAndFreezeThreads()
 
     DWORD currentPid = GetCurrentProcessId();
     DWORD currentTid = GetCurrentThreadId(); // TID del propio hilo guard
+
+    // Obtener el rango de nuestro propio proxy DLL para el chequeo de auto-suspensión.
+    // Este rango siempre estará presente en modRanges también, pero lo resolvemos
+    // explícitamente aquí como medida de seguridad adicional.
+    DWORD_PTR selfBase = 0, selfEnd = 0;
+    {
+        HMODULE hSelf = nullptr;
+        GetModuleHandleExA(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            (LPCSTR)&MonitorAndFreezeThreads,
+            &hSelf);
+        if (hSelf)
+        {
+            MODULEINFO mi = {};
+            if (GetModuleInformation(GetCurrentProcess(), hSelf, &mi, sizeof(mi)))
+            {
+                selfBase = (DWORD_PTR)mi.lpBaseOfDll;
+                selfEnd  = selfBase + mi.SizeOfImage;
+            }
+        }
+    }
 
     // Construir rangos de módulos legítimos para este ciclo
     std::vector<ModuleRange> modRanges = BuildModuleRanges();
@@ -734,7 +793,12 @@ static void MonitorAndFreezeThreads()
                                startAddr <  GHOST_BASE + GHOST_RANGE);
         bool inPrivateMem   = !IsAddressInKnownModule(startAddr, modRanges) && memPrivate;
 
-        if (inGhostRange || inPrivateMem)
+        // Chequeo de auto-suspensión: nunca suspender un hilo cuya dirección de
+        // inicio pertenece a nuestro propio proxy DLL, independientemente del
+        // resultado de IsAddressInKnownModule (defensa en profundidad).
+        bool isSelfThread = (selfBase && startAddr >= selfBase && startAddr < selfEnd);
+
+        if (!isSelfThread && (inGhostRange || inPrivateMem))
         {
             const char* reason = inGhostRange
                 ? "MODULO_FANTASMA_0x63480000"
@@ -781,7 +845,7 @@ static DWORD WINAPI ThreadGuardThread(LPVOID)
              g_threadGuardTid, THREAD_GUARD_INTERVAL_MS);
 
     // Espera inicial para que el sistema se estabilice tras la carga del DLL
-    Sleep(2000);
+    Sleep(THREAD_GUARD_STARTUP_DELAY_MS);
 
     while (g_threadGuardRunning.load())
     {
