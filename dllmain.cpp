@@ -322,6 +322,9 @@ static DWORD WINAPI InitializeProxy(LPVOID)
     LOG_INFO("INIT", "║         PROXY INIT THREAD STARTED         ║");
     LOG_INFO("INIT", "╚══════════════════════════════════════════╝");
 
+    // Bloquear la región de inyección del anticheat lo antes posible
+    BlockAnticheatRegion();
+
     UltraLogger::LogProcessInfo();
     UltraLogger::LogSystemInfo();
 
@@ -338,6 +341,7 @@ static DWORD WINAPI InitializeProxy(LPVOID)
     StartMemoryScanner();
     StartHeartbeat();
     HookCreateThread();
+    StartThreadGuard();
 
     LOG_OK("INIT", "╔══════════════════════════════════════════╗");
     LOG_OK("INIT", "║         PROXY INIT COMPLETADO             ║");
@@ -493,6 +497,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved)
     }
     else if (reason == DLL_PROCESS_DETACH)
     {
+        StopThreadGuard();
         StopHeartbeat();
         StopMemoryScanner();
         StopModuleWatcher();
